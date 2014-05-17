@@ -1,7 +1,7 @@
 Evangelion Editor (C64)
 =====================
 
-##YTM/Elysium <ytm@elysium.pl> 28.07.2001
+##YTM/Elysium 28.07.2001
 
 This is an editor for a scene magazine Evangelion that was never released (read
 below for more). It features proportional font, changeable colors, many editing
