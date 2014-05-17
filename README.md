@@ -10,6 +10,9 @@ wordwrap mode, changeable space width, page text compression done during page
 change, it has quite fast proportional text drawing subroutine. It might also
 feature something more, but my memory is less reliable than my C64's :)
 
+#Screenshot
+![Screenshot](/screenshot.png?raw=true "Screenshot from VICE")
+
 #Quick start
 Type 'acme evaeditor.tas' and run evaeditor.prg on your C64
 Type RUN/STOP to get to menu. CTRL+H sequence does not work, there is no
