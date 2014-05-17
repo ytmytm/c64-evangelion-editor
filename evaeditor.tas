@@ -1,0 +1,3349 @@
+;
+; This piece of software is released under terms of GNU GPL license
+; YTM/Elysium <ytm@elysium.pl> 28.07.2001
+;
+; This is an editor for a scene magazine Evangelion that was never released (read
+; below for more). It features proportional font, changeable colors, many editing
+; functions (line buffer, insert/delete line/page), left/right/full text aligning,
+; wordwrap mode, changeable space width, page text compression done during page
+; change, it has quite fast proportional text drawing subroutine. It might also
+; feature something more, but my memory is less reliable than my C64's :)
+;
+; Quick start:
+; type 'acme evaeditor.tas' and run evaeditor.prg on your C64
+; Type RUN/STOP to get to menu. CTRL+H sequence does not work, there is no
+; information on keybindings, but these are fairly good documented in source.
+; F1/2/3 are for text justifying, F5/6 next/previous page.
+;
+; History:
+; You can find revisions below. I started writting this editor in summer '96
+; for C-64,5 magazine. It was constantly bugfixed and changed to summer '98.
+; Then C-64,5 died and Evangelion was about to rise on its remains. However in
+; the 1st quater of '99 it was clear to me that Evangelion #1 will never be released.
+; Development took too much time and I had other important things to do.
+;
+; Build:
+; The editor can be build with ACME crossassembler (search ftp.elysium.pl for it).
+; Resulting binary is ready for running and/or crunching.
+; Whole thing was initially written in Turbo Macro Assembler and at the end had ~3000
+; lines. On 30.12.1998 it was moved to PC for use with MMS/Taboo 6502tass and on 28.07
+; it was converted for use with ACME.
+;
+; Info:
+; The editor uses own file format. The first page contains offsets to next pages
+; (e.g. $0000/$0001 points to start of page1), at offset $0100 you have the first
+; page. Pages are organized in 23x128 bytes rows, all run-length packed. The magic value
+; is $ff, look into pack subroutine for more. In order to display a page it is not
+; necessary to decompress a page. (in case you didn't know that already). There is also
+; line colors info attached somewhere (23 bytes) but I can't remember where.
+;
+
+;------------------------------------------
+;
+; Evangelion FullScreen Proportional Editor
+;  by Maciej 'YTM/Alliance' Witkowiak
+;      proporcje by Antares
+;
+; source - wersja dla TASS by MMS/Taboo
+;
+;Powstawanie C-64,5 Edit do v2.2
+;21-25.08.96, 08-12.11.96, 17-22.12.96
+;15-17.05.97, 14,20-23.07.97, 18.08.97
+;21-25.08.97, 11.10.97, 12-14.06.98,
+;09.08.98
+;Powstawanie EFSPEdit v1.0
+;19.11,05.12.98 - zmiana statusu, wielkosci strony, rozmieszczenia danych w RAM
+;30.12.98 - przeniesienie source na PC i zmiana srodowiska
+;02.01.99 - kolory, optymalizacja
+;03.01.99 - dolaczenie procedur dyskowych, generic menu
+;18.02.99 - poprawki z Antaresem
+;20,27-28.02.99 - male optymalizacje
+;27.07.01 - przenosiny do ACME, release pod GPL
+;------------------------------------------
+;dolaczone pliki:
+;font.bin - zawiera font i tabelki rysowania
+;widthtab.bin - zawiera tabelke rysowania
+;brakuje plikow z turbodosem i stronami pomocy
+;------------------------------------------
+;To Do:
+;- maly blad w nextpage, jezeli mamy ostatnia strone (w ogole)
+;- obrazki (raczej niemozliwe na razie)
+;------------------------------------------
+;Menu:
+;- load/save - sprawdzic na komie
+;- cos zrobic z nieuzywanymi kodami hotkeys
+;- dopracowac menu wizualnie
+;------------------------------------------
+
+;struktura save'a - w pierwszym bajcie tabelki - liczba wolnych stron,
+;pobrac i zamienic na mb adresu tekstu
+;za tekstem - #ysize bajtow z kolorami linii
+
+!to "evaeditor.prg"
+!cpu 6502
+
+false	 = 0
+true	 = $ff
+
+mhz2	 = false ; wykorzystanie 2MHz
+		 ; 0 - false, 1 - true
+		 ; developing - false, testy - false/true, release - true
+turbodos = false ; wykorzystanie TurboLoadSave/Explorer
+		 ; developing - false, testy,release - true
+
+maxchar  = $80		; liczba znakow w linii
+lstpage  = $80-1		; liczba stron
+
+xstart	 = 0		; lewy margines
+xend	 = 319		; prawy margines
+
+ystart	 = 2		; linia poczatkowa
+yend	 = 25		; linia koncowa
+ysize	 = yend-ystart	; rozmiar w y
+
+stdcolor  = $0c 	; standardowe kolory
+menucolor = $bf 	; kolory menu
+coltransp = $11 	; kolor przezroczysty w tabeli (w jego miejsce - standardowy)
+
+screen	 = $4000	; adres bitmapy
+colormap = $6000	; adres colmapy (lgh:$03e7)
+chbuff	 = $63e8	; bufor na znaki przy wypisywaniu (lgh:$08)
+font	 = $6400	; adres fontu (lgh:$0800)
+
+	*=font
+!binary "font.bin",,2
+
+textbuf  = $3000	; adres bufora edycji
+packbuf  = $3000	; adres bufora pakowania (moze byc jak textbuf, ale
+			; trzeba wyczyscic przed wyswietleniem nowej strony
+			; w init, insert page
+colors	 = textbuf+(ysize*maxchar)
+			; adres tablicy kolorow linii
+buffer	 = $3e00	; adres pierwszego bufora linii (line to/from buff)
+buffer2  = buffer+maxchar	; adres drugiego bufora linii	(justification)
+tabszer  = $3f00			; adres tabelki szerokosci znakow
+
+	*=tabszer
+!binary "widthtab.bin",,2
+
+sprite	 = $6f00			; adres bufora dwoch sprajtow (lgh:$80)
+lpacktab = $7000			; adres tabelki z adresami stron
+hpacktab = lpacktab+lstpage+1
+txt	 = hpacktab+lstpage+1		; poczatek bufora tekstu
+txtend	 = $cfff			; koniec bufora tekstu
+
+adloy	 = $6bf0	; adres tabelek rysowania
+adhiy	 = adloy+$19
+adlox	 = adloy+$32
+adflo	 = adloy+$0132
+adfhi	 = adloy+$0205
+
+hlpg1	 = $2b00	; adresy stron pomocy (gdzies za kodem, przed textbuf)
+hlpg2	 = $2b00
+
+			!if (turbodos) {
+trload	 = $0c00	; skoki do turbodosu (zmienic z $0c00)
+trsave	 = $0c03
+			}
+
+rlznl	 = $02		; lista uzywanych komorek na stronie 0
+rlznh	 = $03
+realzn	 = $04
+pgstat	 = $05
+lmarg	 = $06
+hmarg	 = $07
+story	 = $08
+rowl	 = $09
+rowh	 = $0a
+
+mb	 = $14
+sb	 = $15
+
+just	 = $43
+lastpg	 = $44
+keystat  = $45
+wrap	 = $46
+wxlo	 = $47
+wxhi	 = $48
+wy	 = $49
+page	 = $4a
+actznak  = $4b
+tl	 = $4c
+th	 = $4d
+stat	 = $4e
+znak	 = $4f
+
+pom1	 = $b0
+
+wygl	 = $b0
+wygl2	 = $b2
+fonnt	 = $b4
+sry	 = $b6
+addb	 = $b7
+awy	 = $b8
+
+test	 = $f7
+maxpage  = $f8
+
+control  = $ff
+thbyt	 = $f9
+
+sl	 = $fa
+sh	 = $fb
+el	 = $fc
+eh	 = $fd
+dl	 = $fe
+dh	 = $ff
+
+; makro do wypisywania tekstu, wlaczony KERNAL i BASIC
+		!macro pr .string {
+		lda #<.string
+		ldy #>.string
+		jsr $ab1e
+			}
+
+		*= $0801
+		!word $080b,1999
+		!byte $9e
+		!text "2061"
+		!byte $00,$00,$00
+
+		sei
+		ldx #0
+		txa
+pcktbcl 	sta lpacktab,x
+		inx
+		bne pcktbcl
+		lda #<txt
+		sta lpacktab
+		sta lpacktab+1
+		lda #>txt
+		sta hpacktab
+		sta hpacktab+1
+
+		lda #$73
+		sta space
+		sta space2
+		ldx #0
+buclr		sta buffer,x
+		sta buffer2,x
+		inx
+		cpx #maxchar
+		bne buclr
+		lda #<irq
+		ldx #>irq
+		sta $0314
+		stx $0315
+		lda #<nmi
+		ldx #>nmi
+		sta $0318
+		sta $0319
+		lda #$3b
+		sta $d011
+		lda #$80
+		sta $d018
+		lda #$31
+		sta $d012
+		lda #$f1
+		sta $d01a
+		lda #$7f
+		sta $dc0d
+		lda #0
+		sta $dc0e
+		sta $d015
+		sta $d020
+		sta $d021
+		lda #$1f
+		sta $d418
+		lda $dd00
+		and #%11111100
+		ora #%00000010
+		sta $dd00
+		cli
+		lda #1
+		sta $0286
+		lda #0
+		sta page
+		sta lastpg
+		sta maxpage
+		sta pgstat
+		jsr clrpage
+		jsr packpage
+		jsr clrpage
+		jmp editor
+
+inistats	lda #<(20*8)
+		ldx #>(20*8)
+		sta wxlo
+		stx wxhi
+		lda #<asksure
+		ldx #>asksure
+		ldy #1
+		jsr prstr
+		lda #0
+		sta wxlo
+		sta wxhi
+		lda #<strona
+		ldx #>strona
+		ldy #0
+		jsr prstr
+		lda #14*8
+		sta wxlo
+		lda #<modet
+		jsr prstline
+		lda #<(20*8)
+		sta wxlo
+		lda #<wrapt
+		jsr prstline
+		lda #<(26*8)
+		sta wxlo
+		lda #<justt
+		jsr prstline
+		lda #0
+		sta wxlo
+		lda #<wolne
+		ldy #1
+		jsr prstr2
+		lda #14*8
+		sta wxlo
+		lda #<spact
+		ldy #1
+		jsr prstr2
+		lda #228
+		sta wxlo
+		lda #<pomoc
+		ldy #1
+		jsr prstr2
+		lda #<(32*8)
+		ldx #>(32*8)
+		sta wxlo
+		stx wxhi
+		lda #<chart
+		jmp prstline
+
+prstline	ldy #0
+		jmp prstr2
+
+phex		ldy #1
+		pha
+		jsr pdig
+		pla
+		lsr
+		lsr
+		lsr
+		lsr
+pdig		and #%00001111
+		ora #"0"
+		cmp #"9"+1
+		bcc *+4
+		adc #6
+		sta cyfra,y
+		dey
+		rts
+
+nmi		rti
+
+irq		inc $d019
+			!if (mhz2) {
+		lda #0
+		sta $d030
+			}
+		lda test
+		eor #1
+		sta test
+d011	= *+1
+		lda #$3b
+		sta $d011
+d018  = *+1
+		lda #$80
+		sta $d018
+			!if (mhz2) {
+		lda #<irq2
+		ldx #>irq2
+		sta $0314
+		stx $0315
+		lda #$fb
+		sta $d012
+		jmp $ea31
+
+irq2		inc $d019
+		lda #1
+		sta $d030
+		lda #<irq
+		ldx #>irq
+		sta $0314
+		stx $0315
+		lda #$31
+		sta $d012
+		jmp $ea31
+			} else {
+		jmp $ea31
+			}
+
+			.page
+strona		!text "STRONA", 0
+wolne		!text $76, "WOLNE:", 0
+pomoc		!text "CTRL+H - POMOC", 0
+modet		!text "MODE:", 0
+wrapt		!text "WRAP:", 0
+justt		!text "JUST:", 0
+chart		!text "CHAR:", 0
+spact		!text "SPC:", 0
+asksure 	!text "R U SURE?", 0
+string		!text " ",0
+			.endp
+
+editor
+	 lda #$32
+	 sta $d012
+	 jsr clear
+	 jsr clrstats
+	 lda #$73
+	 sta space
+	 sta space2
+	 lda #stdcolor
+	 sta $d021
+	 jsr kolor
+	 lda #$80
+	 sta $028a
+
+	 ldx #0
+edinlp	 lda #$0b
+	 sta $d800,x
+	 sta $d900-$98+40,x
+	 lda #$0c
+	 sta $d990,x
+	 sta $da00,x
+	 sta $db00,x
+	 inx
+	 bne edinlp
+
+	 lda #3
+	 sta $d015
+	 lda #1
+	 sta $d027
+	 lda #0
+	 sta $d028
+	 sta $d01b
+	 sta $d01c
+	 sta $d01d
+	 sta $d017
+	 lda #25+(36*8)-256
+	 sta $d002
+	 lda #50
+	 sta $d003
+	 lda #%00000010
+	 sta $d010
+
+	 ldx #(sprite-$4000)/$40
+	 stx colormap+1016
+	 inx
+	 stx colormap+1017
+	 ldx #0
+	 txa
+klo	 sta sprite,x
+	 sta sprite+$40,x
+	 inx
+	 cpx #$40
+	 bne klo
+	 ldx #0
+	 lda #%10000000
+klo2	 sta sprite,x
+	 inx
+	 inx
+	 inx
+	 cpx #24
+	 bne klo2
+;^^init
+	 jsr inistats
+		lda #$60
+		sta here0
+	 lda space
+	 jsr spshow
+		lda #$4c
+		sta here0
+		jsr freeshow
+	 lda lastpg
+	 sta page
+	 jsr prpage
+	 lda #4
+	 sta just
+	 lda #1
+	 sta wrap
+	 jsr wrshow
+	 jsr justshow
+	 lda #0
+	 sta lmarg
+	 sta hmarg
+
+	 lda #$0b
+	 sta $d020
+
+init	 jsr resettxt
+	 jsr resetx
+	 lda #ystart
+	 sta wy
+	 lda #0
+	 sta znak
+	 sta stat
+	 sta realzn
+	 sta rlznl
+	 sta rlznh
+	 sta keystat
+	 jsr setkey
+
+mainloop jsr kurpos
+	 jsr ctlgh
+	 lda stat
+	 beq maiconti
+	 lda wy
+	 cmp #yend-1
+	 beq maiconti
+	 jmp newline
+maiconti lda $028d
+	 cmp #3
+	 bne maicon2
+maico2	 lda $028d
+	 bne maico2
+	 lda keystat
+	 eor #1
+	 sta keystat
+	 jsr setkey
+maicon2  lda $c6
+	 beq maiconti
+
+	 lda $028d
+	 and #$0f
+	 bne niebez
+	 lda keystat
+	 beq nienew
+	 lda #<new
+	 ldx #>new
+	 jmp poke
+nienew	 lda #<bez
+	 ldx #>bez
+	 jmp poke
+niebez	 lda $028d
+	 and #$01
+	 beq nieshift
+	 lda #<shift
+	 ldx #>shift
+	 jmp poke
+nieshift lda $028d
+	 and #$2d
+	 bne niecomm
+	 lda #<comm
+	 ldx #>comm
+	 jmp poke
+niecomm  lda #<ctrl
+	 ldx #>ctrl
+poke	 sta mb
+	 stx sb
+	 lda #0
+	 sta $c6
+	 ldy $cb
+	 lda (mb),y
+	 beq maiconti
+	 sta actznak
+
+	 cmp #$ee	;run/stop - quit to menu
+	 bne nie0
+	 jsr packpage
+	 bcc quit
+	 jmp mainloop
+quit	 jmp domenu
+
+nie0	 cmp #$fb	;del
+	 bne nie1
+	 jsr del
+	 jmp mainloop
+
+nie1	 cmp #$f7	;crsr left
+	 bne nie2
+	 jmp nextchar
+
+nie2	 cmp #$f8	;crsr right
+	 bne nie3
+	 lda #0
+	 sta stat
+	 dec znak
+	 lda znak
+	 bmi zerz
+	 jmp mainloop
+zerz	 lda #0
+	 sta znak
+	 jsr lastchar
+	 jmp mainloop
+
+nie3	 cmp #$f9	;crsr down
+	 bne nie4
+	 jmp nlcont
+
+nie4	 cmp #$fa	;crsr up
+	 bne nie5
+	 jsr popline
+	 jmp mainloop
+
+nie5	 cmp #$fd	;home
+	 bne nie6
+	 lda #ystart
+	 sta wy
+	 jsr resettxt
+	 jsr resetx
+	 lda #0
+	 sta znak
+	 sta stat
+	 jmp mainloop
+
+nie6	 cmp #$fe	;clr
+	 bne nie7
+	 jsr askclr
+	 bcc clrok
+	 jmp mainloop
+clrok	 jsr clrpage
+	 jsr prpage
+	 jmp init
+
+nie7	 cmp #$fc	;insert
+	 bne nie8
+	 jsr inst
+	 jmp mainloop
+
+nie8	 cmp #$f0	;f7	- delete line
+	 bne nie9
+	 jsr delline
+	 jmp mainloop
+
+nie9	 cmp #$ef	;f8	- insert line
+	 bne nie10
+	 jsr instline
+	 jmp mainloop
+
+nie10	 cmp #$f1	;f6	- previous page
+	 bne nie11
+	 jmp prvpage
+
+nie11	 cmp #$f2	;f5	- next page
+	 bne nie12
+	 jmp nxtpage
+
+nie12	 cmp #$f6	;f1	- center
+	 bne nie13
+	 jsr centerjus
+	 jmp updateln
+
+nie13	 cmp #$e7	;c=+f5	- line from buffer
+	 bne nie14
+	 jsr frombuff
+	 jmp mainloop
+
+nie14	 cmp #$e8	;c=+f3	- line to buffer
+	 bne nie15
+	 jsr tobuff
+	 jmp mainloop
+
+nie15	 cmp #$dc	;c=+w	- change wrap
+	 bne nie16
+	 jsr changewrap
+	 jmp mainloop
+
+nie16	 cmp #$e6	;c=+RET - set left margin (akapit)
+	 bne nie17
+	 lda wxlo
+	 sta lmarg
+	 lda wxhi
+	 sta hmarg
+	 jmp mainloop
+
+nie17	 cmp #$ec	;c=++	- space+
+	 bne nie18
+	 jmp spacepl
+
+nie18	 cmp #$eb	;c=+-	- space -
+	 bne nie19
+	 jmp spacemi
+
+nie19	 cmp #$ea	;SH++	- page +3
+	 bne nie20
+	 jmp page3pl
+
+nie20	 cmp #$e9	;SH+-	- page -3
+	 bne nie21
+	 jmp page3mi
+
+nie21	 cmp #$f4	;f3	- to left
+	 bne nie22
+	 jsr leftjus
+	 jmp updateln
+
+nie22	 cmp #$f3	;f4	- to right
+	 bne nie23
+	 jsr rightjus
+	 jmp updateln
+
+nie23	 cmp #$ed	;SH+RET -last character of current line
+	 bne nie24
+	 jsr lstchar
+	 jmp mainloop
+
+nie24	 cmp #$e5	;c=+u	- undo
+	 bne nie25
+	 lda pgstat
+	 beq niespak
+	 jmp depackpg
+niespak  jmp mainloop
+
+nie25	 cmp #$e4	;c=+f7	- set last page
+	 bne nie26
+	 jmp setlstpg
+
+nie26	 cmp #$e3	;c=+f1	- clear all
+	 bne nie27
+	 jmp clearall
+
+nie27	 cmp #$e2	;ctrl+d - directory of all files
+	 bne nie28
+	 ;^jmp dirall
+
+nie28	 cmp #$e1	;c=+d	- directory of article files
+	 bne nie29
+	 ;^jmp dirart
+
+nie29	 cmp #$e0	;ctrl+g - save article
+	 bne nie30
+	 ;^jmp save
+
+nie30	 cmp #$df	;ctrl+f - load article
+	 bne nie31
+	 ;^jmp load
+
+nie31	 cmp #$de	;ctrl+j - convert from v1.0 (or C64,5 Ed)
+	 bne nie32
+	 ;^jmp convold
+
+nie32	 cmp #$dd	;ctrl+h - help
+	 bne nie33
+	 ;^jmp help
+
+nie33	 cmp #$f5	;f2	- full justification
+	 bne nie34
+	 jsr fulljus
+	 jmp updateln
+
+nie34	 cmp #$db	;c=+j	- automatic justification change
+	 bne nie35
+	 jsr changejust
+	 jmp mainloop
+
+nie35	 cmp #$da	;c=+DEL - delete page
+	 bne nie36
+	 jmp deletepg
+
+nie36	 cmp #$d9	;c=+HOME- insert page
+	 bne nie37
+	 jmp insertpg
+
+nie37		cmp #$d8	;c=+b	- change background color
+		bne nie38
+		jmp colback
+
+nie38		cmp #$d7	;c=+f	- change foreground color
+		bne niel
+		jmp colfore
+
+niel	 cmp #$ff	;cr
+	 bne nie
+	 jmp dojust
+
+nie	 ldy znak
+	 lda (tl),y
+	 sta story
+	 lda actznak
+	 sta (tl),y
+	 jsr ctlgh
+
+	 lda rlznh
+	 beq niecont2
+	 lda rlznl
+	 cmp #<xend
+	 bcs ncncc
+
+niecont2 jsr prwiersz
+	 jmp nextchar
+
+ncncc	 lda story
+	 ldy znak
+	 sta (tl),y
+	 jsr ctlgh
+
+ncnc	 lda realzn
+	 cmp znak
+	 beq ncnc2
+	 bcc wrrap
+	 jmp mainloop
+
+ncnc2		lda wy
+		cmp #yend-1
+		bne wrrap
+		jmp mainloop
+
+wrrap	 lda actznak
+	 jsr testspc
+	 bcc newline
+	 lda wrap
+wron	 cmp #1
+	 beq charwrap
+	 lda actznak
+	 jsr testspc
+	 bcc ydalej0
+	 lda wy
+	 cmp #yend-1
+	 beq wrfault
+	 jsr testline
+	 bcs charwrap
+	 jsr wordwrap
+wrfault  jmp mainloop
+
+charwrap lda wy
+	 cmp #yend-1
+	 beq ydalej0
+	 inc wy
+	 lda #0
+	 sta stat
+	 sta znak
+	 jsr inctl
+ydalej0  jsr resetx
+
+niecont  lda actznak
+	 ldy znak
+	 sta (tl),y
+	 jmp niecont2
+
+newline  lda lmarg
+	 sta wxlo
+	 lda hmarg
+	 sta wxhi
+
+nlcont	 lda wy
+	 cmp #yend-1
+	 beq ncend
+	 inc wy
+	 lda #0
+	 sta stat
+	 lda tl
+	 clc
+	 adc #maxchar
+	 sta tl
+		bcc *+4
+		inc th
+	 jsr evalx
+
+nextchar lda stat
+	 bne ncend
+	 inc znak
+	 lda znak
+	 cmp #maxchar
+	 beq tniedal
+ncend	 jmp mainloop
+
+tniedal  lda #1
+	 sta stat
+	 dec znak
+	 jmp mainloop
+
+lastchar lda wy
+	 cmp #ystart
+	 beq lcend
+	 jsr popline
+lstchar  jsr ctlgh
+	 lda realzn
+	 sta znak
+lcend	 rts
+
+evalx	 ldy #0
+	 sty mb
+	 sty sb
+evcont	 lda (tl),y
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc mb
+	 sta mb
+		bcc *+4
+		inc sb
+	 sec
+	 sbc wxlo
+	 sta sl
+	 lda sb
+	 sbc wxhi
+	 sta sh
+	 lda sl
+	 ora sh
+	 beq evend
+	 bpl evend2
+	 iny
+	 cpy #maxchar
+	 bne evcont
+	 beq evend
+
+evend2	 lda wxlo
+	 sec
+	 sbc mb
+	 sta el
+	 lda wxhi
+	 sec
+	 sbc sb
+	 sta eh
+	 lda el
+	 clc
+	 adc tabszer,x
+	 sta el
+	 dey
+	 lda el
+	 cmp sl
+	 bpl evend1
+	 bmi evend
+evend1	 iny
+evend	 sty znak
+	 rts
+
+testline ldy realzn
+	 dey
+tllp0	 lda (tl),y
+	 jsr testspc
+	 bcc tlend
+	 dey
+	 bpl tllp0
+	 sec
+	 rts
+tlend	 clc
+	 rts
+
+ctlgh	 ldy #maxchar-1
+ctlp1	 lda (tl),y
+	 jsr testspc
+	 bcs ctfin
+	 dey
+	 bne ctlp1
+	 beq ctend
+
+ctfin	 iny
+	 sty realzn
+	 lda #0
+	 sta rlznl
+	 sta rlznh
+	 ldy #0
+ctlp2	 lda (tl),y
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc rlznl
+	 sta rlznl
+		bcc *+4
+		inc rlznh
+	 iny
+	 cpy realzn
+	 bne ctlp2
+	 rts
+
+ctend	 sty rlznl
+	 sty rlznh
+	 sty realzn
+	 rts
+
+colback 	lda wy
+		sec
+		sbc #ystart
+		tay
+		lda colors,y
+		cmp #coltransp
+		bne colbl1
+		lda #stdcolor
+colbl1		tax
+		and #$f0
+		sta sl
+		inx
+		txa
+		and #$0f
+		ora sl
+		ldx #0
+colbl2		cmp colforbid,x
+		beq colbl1
+		inx
+		cpx #16
+		bne colbl2
+		jmp colcont
+
+colfore 	lda wy
+		sec
+		sbc #ystart
+		tay
+		lda colors,y
+		cmp #coltransp
+		bne colfl1
+		lda #stdcolor
+colfl1		clc
+		adc #$10
+		ldx #0
+colfl2		cmp colforbid,x
+		beq colfl1
+		inx
+		cpx #16
+		bne colfl2
+colcont 	cmp #stdcolor
+		bne colcont2
+		lda #coltransp
+colcont2	sta colors,y
+		jsr prcolor
+		jmp mainloop
+
+colforbid	!byte $00,$11,$22,$33,$44,$55,$66,$77
+		!byte $88,$99,$aa,$bb,$cc,$dd,$ee,$ff
+
+spacepl  inc space
+	 lda space
+	 cmp #$79
+	 beq spcmx
+	 jmp spshow
+spcmx	 lda #$78
+	 sta space
+	 jmp spshow
+spacemi  dec space
+	 lda space
+	 cmp #$70
+	 beq spcmi
+	 jmp spshow
+spcmi	 lda #$71
+	 sta space
+spshow	 and #$0f
+	 ldy #1
+	 jsr phex
+	 lda cyfra+1
+	 sta string
+	 ldy #0
+	 tya
+spshl	 sta screen+320+(17*8),y
+	 iny
+	 cpy #8
+	 bne spshl
+	 lda #17*8
+	 ldx #0
+	 ldy #1
+	 jsr prstat
+	 lda space
+	 sta space2
+here0		jmp mainloop
+
+wordwrap ldy znak
+	 dey
+wwlp1	 lda (tl),y
+	 jsr testspc
+	 bcc wwfin
+	 dey
+	 bne wwlp1
+wwfin	 iny
+	 sty wrap
+	 ldx #0
+wwlp02	 cpy znak
+	 bne wwlp12
+	 lda actznak
+	 jmp wwlp35
+
+wwlp12	 lda (tl),y
+	 sta buffer2,x
+	 lda space
+	 sta (tl),y
+	 iny
+	 inx
+	 cpy znak
+	 bne wwlp12
+
+wwlp2	 stx wrap
+	 lda actznak
+	 sta znak
+	 jsr prwiersz
+	 inc wy
+	 cmp #yend
+	 beq wwend
+	 jsr inctl
+	 ldy #0
+wwlp3	 lda buffer2,y
+	 sta (tl),y
+	 iny
+	 cpy wrap
+	 bne wwlp3
+	 lda znak
+wwlp35	 sta (tl),y
+	 iny
+	 sty znak
+	 ldy #0
+	 lda space
+wwlp4	 sta buffer2,y
+	 iny
+	 cpy #maxchar
+	 bne wwlp4
+	 jsr prwiersz
+	 lda #2
+	 sta wrap
+	 lda #0
+	 sta stat
+	 rts
+
+wwend	 dec wy
+	 rts
+
+changewrap
+	 inc wrap
+	 lda wrap
+	 cmp #3
+	 bne wrshow
+	 lda #1
+	 sta wrap
+
+wrshow	 cmp #1
+	 bne wrapnch
+	 lda #"C"
+	 bne wrprint
+wrapnch  lda #"W"
+wrprint  sta string
+	 ldy #0
+	 tya
+wrlp	 sta screen+(24*8),y
+	 iny
+	 cpy #8
+	 bne wrlp
+	 lda #24*8
+	 ldx #0
+	 ldy #0
+	 jmp prstat
+
+changejust
+	 inc just
+	 lda just
+	 cmp #5
+	 bne justshow
+	 lda #0
+	 sta just
+
+justshow ldy just
+	 lda jutab,y
+	 sta string
+	 ldy #0
+	 tya
+jushlp	 sta screen+(30*8),y
+	 iny
+	 cpy #8
+	 bne jushlp
+	 lda #30*8
+	 ldx #0
+	 ldy #0
+	 jmp prstat
+
+jutab	 !text "LRCFN"
+
+tobuff	 ldy #0
+tblp	 lda (tl),y
+	 sta buffer,y
+	 iny
+	 cpy #maxchar
+	 bne tblp
+	 rts
+
+frombuff ldy #0
+fblp	 lda buffer,y
+	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne fblp
+	 jmp prwiersz
+
+nxtpage  jsr packpage
+	 bcs freshpg
+
+	 lda page
+	 cmp #lstpage
+	 beq freshpg
+
+	 cmp maxpage
+	 beq newpage
+
+	 inc page
+depackpg jsr clrpage
+	 ldx page
+	 lda lpacktab,x
+	 sta sl
+	 lda hpacktab,x
+	 sta sh
+	 jsr depack
+	 jmp freshpg
+
+newpage  inc page
+	 inc maxpage
+	 jsr clrpage
+freshpg  jsr prpage
+	 jmp init
+
+prvpage  jsr packpage
+	 bcs freshpg
+	 lda page
+	 beq prvend
+	 dec page
+prvend	 jmp depackpg
+
+page3pl  jsr packpage
+	 bcs freshpg
+	 lda page
+	 clc
+	 adc #3
+	 cmp maxpage
+	 bcs p3p
+	 sta page
+	 jmp depackpg
+p3p	 lda maxpage
+	 sta page
+	 jmp depackpg
+
+page3mi  jsr packpage
+	 bcs freshpg
+	 lda page
+	 sec
+	 sbc #3
+	 bmi p3m
+	 sta page
+	 jmp depackpg
+p3m	 lda #0
+	 sta page
+	 jmp depackpg
+
+packpage jsr romoff
+	 jsr pack
+
+			ldx page
+			lda lpacktab+1,x
+			sec
+			sbc lpacktab,x
+			sta mb
+			lda hpacktab+1,x
+			sbc hpacktab,x
+			sta sb
+
+	 lda dl
+	 sec
+	 sbc #<packbuf
+	 sta tl
+	 lda dh
+	 sbc #>packbuf
+	 sta th
+
+	 lda mb
+	 sec
+	 sbc tl
+	 sta sl
+	 lda sb
+	 sbc th
+	 sta sh
+
+	 ldx maxpage
+	 lda lpacktab+1,x
+	 clc
+	 adc tl
+	 sta wxlo
+	 lda hpacktab+1,x
+	 adc th
+	 sta wxhi
+
+	 lda wxlo
+	 sec
+	 sbc mb
+	 sta wxlo
+	 lda wxhi
+	 sbc sb
+	 sta wxhi
+
+	 lda #<txtend
+	 sec
+	 sbc wxlo
+	 lda #>txtend
+	 sbc wxhi
+	 tax
+	 txa
+	 bpl pnie1
+	 jmp pnie2
+
+pnie1	 lda page
+	 cmp maxpage
+	 beq pgrfsh
+
+	 lda sl
+	 bne pnie0
+	 lda sh
+	 beq pgrfsh
+
+pnie0	 lda sh
+	 bmi pniepl0
+	 jsr zsun
+	 jmp pgrfsh
+
+pniepl0  jsr rozsun
+
+pgrfsh	 ldx page
+	 lda lpacktab,x
+	 sta mb
+	 lda hpacktab,x
+	 sta sb
+	 jsr copypage
+	 ldx page
+	 inx
+	 lda mb
+	 sta lpacktab,x
+	 lda sb
+	 sta hpacktab,x
+
+	 jsr freeshow
+	 jsr clear
+	 jsr romon
+	 lda #1
+	 sta pgstat
+	 clc
+	 rts
+
+pnie2	 lda #2
+	 sta $d020
+	 ldx #$80
+	 ldy #0
+pnie3	 dey
+	 bne pnie3
+	 dex
+	 bne pnie3
+	 lda #$0b
+	 sta $d020
+	 jsr romon
+	 sec
+	 rts
+
+insertpg jsr askclr
+	 bcc instpgok
+	 jmp mainloop
+
+instpgok jsr packpage
+	 bcs inspgend
+	 ldx maxpage
+	 cpx #lstpage
+	 beq inspgend
+	 inx
+	 inc maxpage
+inspg0	 lda lpacktab,x
+	 sta lpacktab+1,x
+	 lda hpacktab,x
+	 sta hpacktab+1,x
+	 dex
+	 cpx page
+	 bpl inspg0
+	 jsr clrpage
+	 jsr packpage
+	 bcs delpgok
+		jsr clrpage
+inspgend jmp freshpg
+
+deletepg jsr askclr
+	 bcc delpgok
+	 jmp mainloop
+
+delpgok  ldx page
+	 beq dpg3
+	 cpx maxpage
+	 bne dpg0
+	 dec page
+	 bpl dpg2
+
+dpg0	 lda lpacktab+1,x
+	 sec
+	 sbc lpacktab,x
+	 sta sl
+	 lda hpacktab+1,x
+	 sbc hpacktab,x
+	 sta sh
+	 jsr romoff
+	 jsr zsun
+	 jsr romon
+	 inc maxpage
+	 ldx page
+dpg1	 lda lpacktab+1,x
+	 sta lpacktab,x
+	 lda hpacktab+1,x
+	 sta hpacktab,x
+	 inx
+	 cpx maxpage
+	 bne dpg1
+	 dec maxpage
+dpg2	 dec maxpage
+	 jsr freeshow
+	 jmp depackpg
+dpg3	 cpx maxpage
+	 bne dpg0
+dpg4	 jsr clrpage
+	 jmp freshpg
+
+setlstpg jsr askclr
+	 bcc slpok
+	 jmp mainloop
+slpok	 lda page
+	 sta maxpage
+	 jsr packpage
+	 jmp depackpg
+
+clearall jsr askclr
+	 bcc clalc
+	 jmp mainloop
+clalc	 ldx #0
+	 stx page
+	 stx maxpage
+	 txa
+clall	 sta lpacktab,x
+	 inx
+	 bne clall
+	 lda #<txt
+	 sta lpacktab
+	 sta lpacktab+1
+	 lda #>txt
+	 sta hpacktab
+	 sta hpacktab+1
+	 jsr clrpage
+	 jsr packpage
+		jsr clrpage
+	 jmp freshpg
+
+freeshow ldx maxpage
+	 inx
+	 lda #<txtend
+	 sec
+	 sbc lpacktab,x
+	 sta mb
+	 lda #>txtend
+	 sbc hpacktab,x
+	 ldy #1
+	 jsr phex
+	 lda cyfra
+	 and #$3f
+	 sta ilewolne+1
+	 lda cyfra+1
+	 and #$3f
+	 sta ilewolne+2
+	 lda mb
+	 ldy #1
+	 jsr phex
+	 lda cyfra
+	 and #$3f
+	 sta ilewolne+3
+	 lda cyfra+1
+	 and #$3f
+	 sta ilewolne+4
+	 ldy #0
+	 tya
+frsh	 sta screen+320+(6*8),y
+	 iny
+	 cpy #8*5
+	 bne frsh
+	 lda #6*8
+	 ldy #0
+	 sta wxlo
+	 sty wxhi
+	 iny
+	 lda #<ilewolne
+	 ldx #>ilewolne
+	 jmp prstr
+
+ilewolne !text "$0000", 0
+
+dojust	 lda just
+	 cmp #4
+	 beq djend
+	 asl
+	 tax
+	 lda jjtab,x
+	 sta djjp+1
+	 lda jjtab+1,x
+	 sta djjp+2
+djjp	 jsr leftjus
+	 jsr prwiersz
+djend	 jmp newline
+
+jjtab	 !word leftjus
+	 !word rightjus
+	 !word centerjus
+	 !word fulljus
+
+updateln  jsr prwiersz
+	  jmp mainloop
+
+leftjus  jmp toleft
+
+rightjus jsr toleft
+	 jsr countlgh
+	 jmp toright
+
+centerjus jsr toleft
+	 jsr countlgh
+	 lsr wxhi
+	 ror wxlo
+	 jmp toright
+
+countlgh ldy #maxchar-1
+cllp1	 lda (tl),y
+	 jsr testspc
+	 bcs clfin
+	 dey
+	 bne cllp1
+
+clfin	 iny
+	 sty actznak
+	 lda #0
+	 sta wxlo
+	 sta wxhi
+	 ldy #0
+cllp2	 lda (tl),y
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc wxlo
+	 sta wxlo
+		bcc *+4
+		inc wxhi
+	 iny
+	 cpy actznak
+	 bne cllp2
+	 lda #<xend
+	 sec
+	 sbc wxlo
+	 sta wxlo
+	 lda #>xend
+	 sbc wxhi
+	 sta wxhi
+	 rts
+
+toright  ldy #0
+trlp1	 lda (tl),y
+	 sta buffer2,y
+	 iny
+	 cpy actznak
+	 bne trlp1
+
+	 ldy #0
+	 lda wxlo
+	 and #%00000111
+	 beq trlp15
+	 ora #$70
+	 sta (tl),y
+	 iny
+
+trlp15	 lsr wxhi
+	 ror wxlo
+	 lsr wxhi
+	 ror wxlo
+	 lsr wxhi
+	 ror wxlo
+	 lda wxlo
+	 beq trlp25
+
+trlp21	 lda #$78
+trlp2	 sta (tl),y
+	 iny
+	 dec wxlo
+	 bne trlp2
+
+trlp25	 ldx #0
+trlp3	 lda buffer2,x
+	 sta (tl),y
+	 inx
+	 iny
+	 cpx actznak
+	 bne trlp3
+
+buf2clr  ldx #0
+	 lda space
+trlp4	 sta buffer2,x
+	 inx
+	 cpx #maxchar
+	 bne trlp4
+	 rts
+
+toleft	 jsr copywrds
+	 stx znak
+	 txa
+	 beq ljlp3
+	 ldy #0
+	 lda space
+ljlp1	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne ljlp1
+	 ldy #0
+ljlp2	 lda buffer2,y
+	 sta (tl),y
+	 iny
+	 cpy znak
+	 bne ljlp2
+	 lda #0
+	 sta znak
+ljlp3	 rts
+
+fulljus  jsr copywrds
+	 ldx sh
+	 beq fjend
+	 dex
+	 bne fjcont
+fjend	 rts
+
+fjcont	 lda #<xend-1
+	 sec
+	 sbc wxlo
+	 sta wxlo
+	 lda #>xend-1
+	 sbc wxhi
+	 sta wxhi
+	 ldx sh
+	 lda #0
+	 sta sh
+	 dex
+	 stx sl
+	 ldx #wxlo
+	 ldy #sl
+	 jsr div
+	 lda wxlo
+	 and #%00000111
+	 ora #$70	; $7x == x pixel space
+	 sta sl
+	 lsr wxhi
+	 ror wxlo
+	 lsr wxhi
+	 ror wxlo
+	 lsr wxhi
+	 ror wxlo
+	 lda wxlo
+	 sta sh
+	 jsr putwords
+	 jsr ctlgh
+	 lda #<xend
+	 sec
+	 sbc rlznl
+	 beq fjend
+	 sta wxlo
+	 jmp putaddspc
+
+putaddspc ldy #maxchar-2
+paslp1	 lda (tl),y
+	 iny
+	 sta (tl),y
+	 dey
+	 jsr testspc
+	 bcs paslp2
+	 dey
+	 bpl paslp1
+paslp2	 lda (tl),y
+	 iny
+	 sta (tl),y
+	 dey
+	 jsr testspc
+	 bcc pascnt
+	 dey
+	 bpl paslp2
+pascnt	 iny
+	 lda wxlo
+	 ora #$70
+	 sta (tl),y
+	 rts
+
+putwords ldy #0
+	 ldx #0
+pwlp1	 lda buffer2,x
+	 jsr testspc
+	 bcc pwlp2
+	 sta (tl),y
+	 inx
+	 iny
+	 cpy #maxchar
+	 bne pwlp1
+pwend	 rts
+
+pwlp2	 stx actznak
+	 ldx sh
+	 beq pwlp4
+	 lda #$78
+pwlp3	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 beq pwend
+	 dex
+	 bne pwlp3
+pwlp4	 ldx sl
+	 cpx #$70
+	 beq pwlp5
+	 txa
+	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 beq pwend
+pwlp5	 ldx actznak
+	 inx
+	 jmp pwlp1
+
+copywrds lda #0
+	 sta wxlo
+	 sta wxhi
+	 sta sh
+	 jsr buf2clr
+
+	 ldy #0
+	 ldx #0
+cwlp1	 lda (tl),y
+	 jsr testspc
+	 bcc cwlp2
+	 jmp cwlp3
+cwlp2	 iny
+	 cpy #maxchar
+	 bne cwlp1
+cwend	 rts
+
+cwlp3	 lda (tl),y
+	 jsr testspc
+	 bcc cwlp4
+	 sta buffer2,x
+	 sta sl
+	 stx story
+	 lda sl
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc wxlo
+	 sta wxlo
+	 bcc *+4
+	 inc wxhi
+	 ldx story
+	 inx
+	 iny
+	 cpy #maxchar
+	 bne cwlp3
+	 rts
+
+cwlp4	 lda space
+	 sta buffer2,x
+	 inc sh
+	 inx
+	 iny
+	 jmp cwlp1
+
+div	 lda #$00
+	 sta pom1
+	 sta pom1+1
+	 lda #$10
+	 sta pom1+2
+divloop0 asl $00,x
+	 rol $01,x
+	 rol pom1
+	 rol pom1+1
+	 lda pom1
+	 sec
+	 sbc $00,y
+	 sta pom1+3
+	 lda pom1+1
+	 sbc $01,y
+	 bcc divloop1
+	 inc $00,x
+	 sta pom1+1
+	 lda pom1+3
+	 sta pom1
+divloop1 dec pom1+2
+	 bne divloop0
+	 rts
+
+instline	jsr idlstore
+	 lda #<((ysize-1)*maxchar)
+	 clc
+	 adc #<textbuf
+	 sta tl
+	 lda #>((ysize-1)*maxchar)
+	 adc #>textbuf
+	 sta th
+
+	 lda tl
+	 sec
+	 sbc #maxchar
+	 sta mb
+	 lda th
+	 sbc #0
+	 sta sb
+
+	 ldx #yend
+inlloop0 ldy #0
+inlloop1 lda (mb),y
+	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne inlloop1
+	 lda tl
+	 sec
+	 sbc #maxchar
+	 sta tl
+	 lda th
+	 sbc #0
+	 sta th
+	 lda mb
+	 sec
+	 sbc #maxchar
+	 sta mb
+	 lda sb
+	 sbc #0
+	 sta sb
+	 dex
+	 cpx wy
+	 bne inlloop0
+
+	   jsr idlrestore
+	   ldy #0
+	 lda space
+inlloop2 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne inlloop2
+		lda wy
+		sec
+		sbc #ystart
+		sta sl
+		ldx #ysize-1
+inscol1 	lda colors,x
+		sta colors+1,x
+		dex
+		cpx sl
+		bpl inscol1
+		lda #coltransp
+		inx
+		sta colors,x
+	 jsr prpgfrom
+	 jmp idlrestore
+
+delline jsr idlstore
+	   inc wy
+	 lda wy
+	 cmp #yend
+	 beq dlloop2
+	 lda tl
+	 clc
+	 adc #maxchar
+	 sta mb
+	 lda th
+	 adc #0
+	 sta sb
+
+dlloop0  ldy #0
+dlloop1  lda (mb),y
+	 sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne dlloop1
+	 jsr inctl
+	 lda mb
+	 clc
+	 adc #maxchar
+	 sta mb
+		bcc *+4
+		inc sb
+	 inc wy
+	 lda wy
+	 cmp #yend
+	 bne dlloop0
+
+dlloop2  ldy #0
+	 lda space
+dlloop3  sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne dlloop3
+		jsr idlrestore
+		lda wy
+		sec
+		sbc #ystart
+		tax
+		inx
+dlcol1		lda colors,x
+		sta colors-1,x
+		inx
+		cpx #ysize
+		bmi dlcol1
+		dex
+		lda #coltransp
+		sta colors,x
+	 jsr prpgfrom
+
+idlrestore	lda eh
+		sta th
+		lda el
+		sta tl
+		lda dh
+		sta znak
+		lda dl
+		sta wy
+		rts
+
+idlstore	lda wy
+		sta dl
+		lda znak
+		sta dh
+		lda tl
+		sta el
+		lda th
+		sta eh
+		rts
+
+inst	 lda space
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc rlznl
+	 sta mb
+	 lda rlznh
+	 adc #0
+	 cmp #>xend
+	 bne incon
+	 lda mb
+	 cmp #<xend
+	 bcc incon
+	 rts
+
+incon	 ldy #maxchar-2
+	 dec znak
+inloop	 lda (tl),y
+	 iny
+	 sta (tl),y
+	 dey
+	 dey
+	 cpy znak
+	 bne inloop
+
+	 ldy znak
+	 iny
+	 lda space
+	 sta (tl),y
+	 jsr prwiersz
+	 inc znak
+	 rts
+
+del	 ldy znak
+	 beq dell
+
+deloop	 lda (tl),y
+	 dey
+	 sta (tl),y
+	 iny
+	 iny
+	 cpy #maxchar
+	 bne deloop
+	 ldy #maxchar-1
+	 lda space
+	 sta (tl),y
+	 jsr prwiersz
+	 dec znak
+	 lda #0
+	 sta stat
+	 rts
+dell	 jmp lastchar
+
+popline  lda #0
+	 sta stat
+	 dec wy
+	 lda wy
+	 cmp #ystart
+	 bmi zer
+	 lda tl
+	 sec
+	 sbc #maxchar
+	 sta tl
+	 lda th
+	 sbc #0
+	 sta th
+	 jsr evalx
+	 inc znak
+	 rts
+
+zer	 lda #ystart
+	 sta wy
+	 jmp resettxt
+
+prpage	 lda #ystart
+	 sta wy
+	 jsr resettxt
+prpgfrom jsr resetx
+
+pgpr	 lda #0
+	 sta znak
+	 sta stat
+	 jsr prwiersz
+	 jsr inctl
+	 inc wy
+	 lda wy
+	 cmp #yend
+	 bne pgpr
+
+	 ldy #1
+	 lda page
+	 jsr phex
+	 lda cyfra
+	 sta strnum+1
+	 lda cyfra+1
+	 and #$3f
+	 sta strnum+2
+	 ldy #1
+	 lda maxpage
+	 jsr phex
+	 lda cyfra
+	 sta strnum+5
+	 lda cyfra+1
+	 and #$3f
+	 sta strnum+6
+	 ldy #0
+	 tya
+pgpr1	 sta screen+(6*8),y
+	 iny
+	 cpy #8*5
+	 bne pgpr1
+	 lda #6*8
+	 ldy #0
+	 sta wxlo
+	 sty wxhi
+	 lda #<strnum
+	 ldx #>strnum
+	 jmp prstr
+
+cyfra	 !text "00"
+strnum	 !text "$00/$00", 0
+
+prwiersz jsr czyscwiersz
+	 jsr resetx
+	 ldy #0
+prwloop  sty story
+	 lda (tl),y
+	 jsr prchar
+	 bcs prwend
+	 ldy story
+	 iny
+	 cpy #maxchar
+	 bne prwloop
+
+prwend	 lda #yend-2
+	 sec
+	 sbc wy
+	 tax
+	 lda adhiy,x
+	 sta sb
+	 lda adloy,x
+	 sta mb
+	 ldy #0
+prwloop2 lda chbuff,y
+	 sta (mb),y
+	 iny
+	 cpy #8
+	 bne prwloop2
+prcolor 	lda wy
+		sec
+		sbc #ystart
+		tax
+		lda ad40hiy,x
+		sta sb
+		lda ad40loy,x
+		sta mb
+		lda colors,x
+		cmp #coltransp
+		bne prcol1
+		lda #stdcolor
+prcol1		ldy #0
+prwloop3	sta (mb),y
+		iny
+		cpy #40
+		bne prwloop3
+	 rts
+
+prstr	 stx sh
+prstr2	 sta sl
+	 sty awy
+	 jsr setrowaddy2
+	 ldy #0
+prsl1	 sty story
+	 lda (sl),y
+	 beq prsen
+	 jsr prchar
+	 ldy story
+	 iny
+	 bne prsl1
+prsen	 rts
+
+czyscwiersz
+	 lda #yend-1
+	 sec
+	 sbc wy
+	 sta awy
+	 jsr setrowaddy
+	 lda rowl
+	 sta mb
+	 lda rowh
+	 sta sb
+	 lda #0
+	 tay
+cwloop1  sta (mb),y
+	 iny
+	 bne cwloop1
+	 inc sb
+cwloop2  sta (mb),y
+	 iny
+	 cpy #$40
+	 bne cwloop2
+cwloop3  lda (mb),y
+	 sta chbuff-$40,y
+	 iny
+	 cpy #$48
+	 bne cwloop3
+	 rts
+
+setrowaddy	    ldy awy
+		    lda adloy,y
+		    sta rowl
+		    lda adhiy,y
+		    sta rowh
+		    rts
+
+setrowaddy2	    lda #yend-1
+		    sec
+		    sbc awy
+		    sta awy
+		    jmp setrowaddy
+
+
+prchar	 sta actznak
+	 jsr testspc
+	 bcs nspac
+	 jmp spac
+nspac
+	 tax
+	 lda adflo,x   ;adres fonta
+	 sta fonnt
+	 lda adfhi,x
+	 sta fonnt+1
+
+	 lda rowl
+	 sta mb
+	 lda rowh
+	 clc
+	 adc wxhi
+	 tay
+	 ldx wxlo
+	 lda adlox,x
+	 adc mb
+	 sta wygl
+	 bcc *+3
+	 iny
+	 sty wygl+1
+	 clc
+	 adc #8
+	 sta wygl2
+	 bcc *+3
+	 iny
+	 sty wygl2+1
+
+	 txa
+	 and #7
+	 bne nowpis
+	 ldy #7
+wpisby	 lda (fonnt),y
+	 sta (wygl),y
+	 dey
+	 bpl wpisby
+	 jmp okiej
+
+nowpis	 ldy #0
+	 cmp #4
+	 bcc *+5
+	 jmp f2
+
+f1	 tax
+	 stx sry
+prawo
+	 sty addb
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 lsr
+	 ror addb
+	 dex
+	 bne *-4
+	 ora (wygl),y
+	 sta (wygl),y
+	 lda addb
+	 sta (wygl2),y
+	 jmp okiej
+
+f2	 eor #7
+	 tax
+	 inx
+	 stx sry
+lewo
+	 sty addb
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+
+	 iny
+	 stx addb
+	 ldx sry
+	 lda (fonnt),y
+	 asl
+	 rol addb
+	 dex
+	 bne *-4
+	 sta (wygl2),y
+	 lda addb
+	 ora (wygl),y
+	 sta (wygl),y
+okiej
+spac	 ldx actznak
+	 lda tabszer,x
+	 clc
+	 adc wxlo
+	 sta wxlo
+	bcc *+4
+	inc wxhi
+	ldx wxhi
+	beq nieend
+	cmp #<xend
+nieend	 rts
+
+kurpos	 jsr resetx
+	 lda znak
+	 beq ksend
+	 ldy #0
+ksloop	 lda (tl),y
+	 tax
+	 lda tabszer,x
+	 clc
+	 adc wxlo
+	 sta wxlo
+	 bcc *+4
+	 inc wxhi
+	 lda wxhi
+	 beq ksnieend
+	 lda wxlo
+	 cmp #<xend+1
+	 bcs ksstoj
+
+ksnieend iny
+	 cpy znak
+	 bne ksloop
+	 beq ksend
+
+ksstoj	 lda #1
+	 sta stat
+	 dec znak
+	 lda znak
+	 sta realzn
+	 jmp kurpos
+
+ksend	 lda wxlo
+	 clc
+	 adc #24
+	 sta $d000
+	 lda wxhi
+	 adc #2
+	 sta $d010
+	 lda wy
+	 asl
+	 asl
+	 asl
+	 clc
+	 adc #50
+	 sta $d001
+	 ldy znak
+	 lda (tl),y
+	 tay
+	 lda tabszer,y
+	 tax
+	 lda szertb,x
+	 sta sprite+$40+(8*3)
+	 lda adflo,y
+	 sta mb
+	 lda adfhi,y
+	 sta sb
+	 ldy #0
+	 ldx #0
+kschlp	 lda (mb),y
+	 sta sprite+$40,x
+	 inx
+	 inx
+	 inx
+	 iny
+	 cpy #8
+	 bne kschlp
+	 rts
+
+szertb	 !byte %00000000,%10000000
+	 !byte %11000000,%11100000
+	 !byte %11110000,%11111000
+	 !byte %11111100,%11111110
+	 !byte %11111111,%11111111
+
+setkey	 ldx #0
+	 txa
+sk1	 sta screen+(18*8),x
+	 inx
+	 cpx #8
+	 bne sk1
+	 lda keystat
+	 bne sk2
+	 lda #"T"
+	 bne sk3
+sk2	 lda #"G"
+sk3	 sta string
+	 lda #18*8
+	 ldx #0
+	 ldy #0
+	 jmp prstat
+
+prstat	 pha
+	 lda wxlo
+	 sta el
+	 lda wxhi
+	 sta eh
+	 pla
+	 sta wxlo
+	 stx wxhi
+	 lda #<string
+	 ldx #>string
+	 jsr prstr
+	 lda el
+	 ldx eh
+	 sta wxlo
+	 stx wxhi
+	 rts
+
+testspc  beq spcpos
+	 cmp space
+	 beq spcpos0
+	cmp #$71
+	bcc spcpos
+	cmp #$79
+	bcs spcpos
+spcpos0 clc
+	rts
+spcpos	sec	; C=1 <$71 i >$78
+	rts
+
+askclr	 ldx #0
+	 lda #$10
+askclp0  sta colormap+40+19,x
+	 inx
+	 cpx #9
+	 bne askclp0
+	 jsr waitkey
+	 pha
+	 ldx #0
+	 lda #$ff
+askclp1  sta colormap+40+19,x
+	 inx
+	 cpx #9
+	 bne askclp1
+	 pla
+	 cmp #"Y"
+	 beq asclok
+	 cmp #"T"
+	 beq asclok
+	 sec
+	 jmp asclend
+asclok	 clc
+asclend  rts
+
+clrpage  jsr resettxt
+	 lda #ystart
+	 sta wy
+clpglp0  lda space
+	 ldy #0
+clpglp1  sta (tl),y
+	 iny
+	 cpy #maxchar
+	 bne clpglp1
+	 jsr inctl
+	 inc wy
+	 lda wy
+	 cmp #yend
+	 bne clpglp0
+		ldy #0
+		lda #coltransp
+clpglp2 	sta colors,y
+		iny
+		cpy #ysize
+		bne clpglp2
+	   rts
+
+inctl	 lda tl
+	 clc
+	 adc #maxchar
+	 sta tl
+		bcc *+4
+		inc th
+	 rts
+
+resetx	 lda #<xstart
+	 sta wxlo
+	 lda #>xstart
+	 sta wxhi
+	 rts
+
+resettxt lda #<textbuf
+	 sta tl
+	 lda #>textbuf
+	 sta th
+	 rts
+
+romoff
+			!if (mhz2) {
+rofl	 lda $0314
+	 cmp #<irq
+	 bne rofl
+	 lda #0
+	 sta $d011
+			}
+	 sei
+	 lda #$36
+	 sta $01
+	 rts
+
+romon	 lda #$36
+	 sta $01
+			!if (mhz2) {
+	 lda #$3b
+	 sta $d011
+			}
+	 cli
+	 rts
+
+clrstats lda #<screen
+	 ldx #>screen
+	 sta mb
+	 stx sb
+	 tay
+	 ldx #2
+csl1	 sta (mb),y
+	 iny
+	 bne csl1
+	 inc sb
+	 dex
+	 bne csl1
+csl2	 sta (mb),y
+	 iny
+	 bpl csl2
+	 rts
+
+clear	 lda #<screen+(ystart*320)
+	 sta mb
+	 lda #>screen+(ystart*320)
+	 sta sb
+	 ldx #((ysize)*320)/256+1
+	 ldy #0
+	 tya
+cloop	 sta (mb),y
+	 iny
+	 bne cloop
+	 inc sb
+	 dex
+	 bne cloop
+	 rts
+
+kolor	 ldx #0
+	 sta colormap+(ystart*40),x
+	 sta colormap+$0100,x
+	 sta colormap+$0200,x
+	 sta colormap+$0300-$18,x
+	 inx
+	 bne kolor+2
+	 ldx #0
+	 lda #menucolor
+kolor2	 sta colormap,x
+	 inx
+	 cpx #ystart*40
+	 bne kolor2
+	 ldx #0
+	 lda #$ff
+kolor3	 sta colormap+40+19,x
+	 inx
+	 cpx #9
+	 bne kolor3
+	 rts
+
+pack	 lda #<textbuf
+	 sta sl
+	 lda #>textbuf
+	 sta sh
+	 lda #<textbuf+(ysize*maxchar)+ysize
+	 sta el
+	 lda #>textbuf+(ysize*maxchar)+ysize
+	 sta eh
+	 lda #<packbuf
+	 sta dl
+	 lda #>packbuf
+	 sta dh
+
+ser1	 ldy #0
+	 lda (sl),y
+	 sta thbyt
+ser2	 iny
+	 cpy #$ff
+	 beq ser3
+	 cmp (sl),y
+	 beq ser2
+ser3	 tya
+	 clc
+	 adc sl
+	 sta test1+1
+	 lda sh
+	 adc #0
+	 sta test2+1
+test2	 lda #0
+	 cmp eh
+	 bcc dopac
+test1	 lda #0
+	 cmp el
+	 bcc dopac
+	 lda el
+	 sbc sl
+	 tay
+dopac	 cpy #4
+	 bcc oneb
+	 lda #control
+	 jsr store
+	 tya
+	 jsr store
+	 lda thbyt
+	 jmp gonx
+oneb	 lda thbyt
+	 cmp #control
+	 bne nocon
+	 jsr store
+	 lda #1
+nocon	 ldy #1
+gonx	 jsr store
+	 tya
+	 clc
+	 adc sl
+	 sta sl
+	 bcc noi2
+	 inc sh
+noi2	 cmp el
+	 bne noten
+	 lda sh
+	 cmp eh
+	 bne noten
+	 lda #control
+	 jsr store
+	 lda #0
+	 jsr store
+	 rts
+noten	 jmp ser1
+store	 sty savy+1
+	 ldy #0
+	 sta (dl),y
+	 inc dl
+	 bne savy
+	 inc dh
+savy	 ldy #0
+	 rts
+
+depack	 lda #<textbuf
+	 sta dl
+	 lda #>textbuf
+	 sta dh
+	 jsr romoff
+depck	 ldy #0
+	 lda (sl),y
+	 cmp #control
+	 bne dost
+	 iny
+	 lda (sl),y
+	 bne notend
+	 jsr romon
+	 rts
+
+notend	 cmp #1
+	 bne ispac
+	 lda #control
+	 jmp dost
+ispac	 tax
+	 iny
+	 lda (sl),y
+	 pha
+	 jsr doad
+	 pla
+morp	 jsr store
+	 dex
+	 bne morp
+	 jmp depck
+dost	 jsr store
+	 jsr doad
+	 jmp depck
+doad	 iny
+	 tya
+	 clc
+	 adc sl
+	 sta sl
+	 bcc noi1
+	 inc sh
+noi1	 rts
+
+copypage lda #<packbuf
+	 sta sl
+	 lda #>packbuf
+	 sta sh
+	 ldy #0
+cplp	 lda (sl),y
+	 sta (mb),y
+	 inc sl
+	 bne *+4
+	 inc sh
+	 inc mb
+	 bne *+4
+	 inc sb
+	 lda sh
+	 cmp dh
+	 bne cplp
+	 lda sl
+	 cmp dl
+	 bne cplp
+	 rts
+
+zsun	 lda sl
+	 sta mb
+	 lda sh
+	 sta sb
+
+	 ldx page
+	 lda lpacktab+1,x
+	 sta tl
+	 lda hpacktab+1,x
+	 sta th
+
+	 ldx maxpage
+	 inx
+	 lda lpacktab,x
+	 sta el
+	 lda hpacktab,x
+	 sta eh
+
+	 lda tl
+	 sec
+	 sbc mb
+	 sta sl
+	 lda th
+	 sbc sb
+	 sta sh
+
+	 ldy #0
+zslp0	 lda (tl),y
+	 sta (sl),y
+	 inc tl
+	 bne *+4
+	 inc th
+	 inc sl
+	 bne *+4
+	 inc sh
+	 lda th
+	 cmp eh
+	 bne zslp0
+	 lda tl
+	 cmp el
+	 bne zslp0
+
+	 inc maxpage
+	 ldx page
+zslp1	 inx
+	 lda lpacktab,x
+	 sec
+	 sbc mb
+	 sta lpacktab,x
+	 lda hpacktab,x
+	 sbc sb
+	 sta hpacktab,x
+	 cpx maxpage
+	 bne zslp1
+	 dec maxpage
+	 rts
+
+rozsun	 lda tl
+	 sec
+	 sbc mb
+	 sta mb
+	 lda th
+	 sbc sb
+	 sta sb
+
+	 ldx page
+	 lda lpacktab+1,x
+	 sta el
+	 lda hpacktab+1,x
+	 sta eh
+	 ldx maxpage
+	 inx
+	 lda lpacktab,x
+	 sta tl
+	 lda hpacktab,x
+	 sta th
+
+	 lda el
+	 sec
+	 sbc #1
+	 sta el
+	 lda eh
+	 sbc #0
+	 sta eh
+
+	 lda tl
+	 clc
+	 adc mb
+	 sta sl
+	 lda th
+	 adc sb
+	 sta sh
+
+	 ldy #0
+rozslp0  lda (tl),y
+	 sta (sl),y
+
+	 lda tl
+	 sec
+	 sbc #1
+	 sta tl
+	 lda th
+	 sbc #0
+	 sta th
+
+	 lda sl
+	 sec
+	 sbc #1
+	 sta sl
+	 lda sh
+	 sbc #0
+	 sta sh
+
+	 lda th
+	 cmp eh
+	 bne rozslp0
+	 lda tl
+	 cmp el
+	 bne rozslp0
+
+	 inc maxpage
+	 ldx page
+rozslp1  inx
+	 lda lpacktab,x
+	 clc
+	 adc mb
+	 sta lpacktab,x
+	 lda hpacktab,x
+	 adc sb
+	 sta hpacktab,x
+	 cpx maxpage
+	 bne rozslp1
+	 dec maxpage
+	 rts
+
+waitkey  jsr $ffe4
+	 beq waitkey
+	 rts
+
+dodirall lda #1
+	 sta dlen+1
+	 jmp dir
+
+dodirart lda #6
+	 sta dlen+1
+
+dir	 jsr $e544
+	 lda #1
+	 ldx $ba
+	 ldy #0
+	 jsr $ffba
+dlen	 lda #1
+	 ldx #<tyt
+	 ldy #>tyt
+	 jsr $ffbd
+	 lda #1
+	 jsr $ffc0
+	 ldx #1
+	 lda #1
+	 jsr $ffc6
+	 jsr $ffcf
+	 jsr $ffcf
+liczba	 jsr $ffcf
+	 jsr $ffcf
+	 lda $90
+	 and #%01000000
+	 bne knc
+	 jsr $ffcf
+	 tax
+	 lda $91
+	 bpl knc
+	 jsr $ffcf
+	 jsr $bdcd
+	 lda #" "
+	 jsr $ffd2
+	 lda #1
+	 sta $0286
+czytaj	 jsr $ffcf
+	 bne bom
+	 lda #13
+	 jsr $ffd2
+	 lda #2
+	 sta $0286
+	 jmp liczba
+bom	 jsr $ffd2
+	 lda $d6
+	 beq czytaj
+	 lda $d3
+	 cmp #24
+	 bmi czytaj
+	 lda #3
+	 sta $0286
+	 jmp czytaj
+knc	 lda #1
+	 jsr $ffc3
+	 jsr $ffcc
+	 +pr dend
+dwait	 jsr waitkey
+		jmp domen
+
+tyt	 !text "$art.*"
+dend	 !byte 13,158,18
+	 !text " press any key "
+	 !byte 146,0
+
+toscreen jsr romoff
+	 lda #$37
+	 sta $01
+	 lda #0
+	 sta $d015
+toscl1		lda $d012
+		cmp #$ff
+		bne toscl1
+		lda #$17
+		sta d018
+		lda $dd00
+		and #%11111100
+		ora #%00000011
+		sta $dd00
+		lda #$1b
+		sta d011
+		cli
+	 rts
+
+backtoed
+	 ldx #0
+	 stx lmarg
+	 stx hmarg
+		jsr romoff
+		lda #$3b
+		sta d011
+		lda #$80
+		sta d018
+		lda $dd00
+		and #%11111100
+		ora #%00000010
+		sta $dd00
+		lda #3
+		sta $d015
+	 jmp romon
+
+dosave	 +pr satxt
+	 jsr getname
+	 lda namelgh
+	 beq saend
+	 jsr savetest
+	 bcs saexist
+sacont	 jsr setname
+	 lda #<lpacktab
+	 ldx #>lpacktab
+	 sta $ac
+	 sta $fe
+	 stx $ad
+	 stx $ff
+	 ldx maxpage
+	 stx lpacktab
+	 lda lpacktab+1,x
+	 sta $ae
+	 lda hpacktab+1,x
+	 sta $af
+			!if (turbodos) {
+	 jsr trsave
+			} else {
+		lda #1
+		ldx $ba
+		ldy #0
+		jsr $ffba
+		lda #$fe
+		ldx $ae
+		ldy $af
+		jsr $ffd8
+			}
+	 lda #<txt
+	 sta lpacktab
+saend	 jmp domen
+
+saexist  +pr satxt2
+sael1	 jsr waitkey
+	 cmp #"Y"
+	 beq sael2
+		cmp #"N"
+		beq saend
+		bne sael1
+sael2	 lda $ba
+	 jsr $ffb1
+	 lda #$6f
+	 jsr $ff93
+	 lda #"S"
+	 jsr $ffa8
+	 lda #":"
+	 jsr $ffa8
+	 lda namelgh
+	 clc
+	 adc #4
+	 sta saeile+1
+	 ldx #0
+sael3	 lda name,x
+	 jsr $ffa8
+	 inx
+saeile	 cpx #16+2
+	 bne sael3
+	 jsr $ffae
+	 jmp sacont
+
+satxt	 !byte 147,151
+	 !text "save article", 0
+satxt2	 !byte 13,13
+	 !text "file exists!  "
+	 !text "replace ? (y/n)", 0
+
+savetest jsr setname
+	 lda #8
+	 ldx $ba
+	 tay
+	 jsr $ffba
+	 lda #8
+	 jsr $ffc0
+	 lda #8
+	 jsr $ffc3
+	 lda $ba
+	 jsr $ffb4
+	 lda #$6f
+	 jsr $ff96
+	 jsr $ffa5
+	 pha
+	 jsr $ffab
+	 pla
+	 cmp #"0"
+	 bne saterr
+	 sec
+	 rts
+saterr	 clc
+	 rts
+
+doload	 lda #<lpacktab
+	 ldx #>lpacktab
+	 sta $ae
+	 stx $af
+
+ldcont	 +pr ldtxt
+	 jsr getname
+	 lda namelgh
+	 beq ldcont3
+
+ldcont2  jsr savetest
+	 bcs ldcont23
+
+	 +pr fnftxt
+ldcont22 jsr waitkey
+	 cmp #"Y"
+		beq ldcont
+		cmp #"N"
+		beq ldcont3
+		bne ldcont22
+
+ldcont23 jsr setname
+			!if (turbodos) {
+	 jsr trload
+	 bcs ldcont3
+			} else {
+		lda #1
+		ldx $ba
+		ldy #0
+		jsr $ffba
+		lda #0
+		ldx $ae
+		ldy $af
+		jsr $ffd5
+			}
+	 lda lpacktab
+	 sta maxpage
+	 lda #0
+	 sta page
+	 lda #<txt
+	 sta lpacktab
+	 lda hpacktab
+	 cmp #>txt
+	 beq ldcont3
+	 sta sb
+	 ldx maxpage
+	 inx
+ldlp1	 lda hpacktab,x
+	 sec
+	 sbc sb
+	 clc
+	 adc #>txt
+	 sta hpacktab,x
+	 dex
+	 bpl ldlp1
+ldcont3  jmp domenuend
+
+ldtxt	 !byte 147,151
+	 !text "load article", 0
+fnftxt	 !byte 13,13
+	 !text "file not found! "
+	 !text "try again? (y/n)", 0
+
+getname  +pr askname
+	 ldx #0
+petla2	 jsr $ffcf
+	 cmp #13
+	 beq juzem2
+	 sta name2,x
+	 inx
+	 cpx #12
+	 bne petla2
+juzem2	 stx namelgh
+	 rts
+
+setname  lda namelgh
+	 clc
+	 adc #4
+	 ldx #<name
+	 ldy #>name
+	 jmp $ffbd
+
+askname  !byte 13,13
+	 !text "return - abort"
+	 !byte 13,13
+	 !text "filename:art.",0
+name	 !text "ART."
+name2	 !text "	    "
+	       ;123456789012
+namelgh  !byte 0
+
+doquited	lda #0
+		sta $d030
+		sta $de00
+		jmp $fce2
+
+doabout 	+pr about
+		+pr about2
+		jsr waitkey
+		bne domen
+
+domenu		jsr toscreen
+domen		lda #1
+		sta $0286
+		+pr menu
+menuloop	jsr waitkey
+		cmp #3
+		beq domenuend
+		cmp #"0"
+		bmi menuloop
+		cmp #"7"
+		bpl menuloop
+		sec
+		sbc #"0"
+		asl
+		tax
+		lda menulo,x
+		sta mnjmp+1
+		lda menulo+1,x
+		sta mnjmp+2
+mnjmp		jmp domenuend
+domenuend	jsr backtoed
+		jmp depackpg
+
+menulo		!word domenuend
+		!word dodirall
+		!word dodirart
+		!word doload
+		!word dosave
+		!word doabout
+		!word doquited
+
+menu		!byte 147,13
+		!text "+----------------------+",13
+		!text "!evangelion editor v0.9!",13
+		!text "+----------------------+",13
+		!text "  0 - powrot do edycji",13
+		!text "  1 - katalog dysku",13
+		!text "  2 - katalog artow",13
+		!text "  3 - load",13
+		!text "  4 - save",13
+		!text "  5 - info",13
+		!text "  6 - koniec",13
+		!text "+----------------------+",13,0
+
+about		!byte 147,13
+		!text "kod  : ytm/alliance",13
+		!text "font : fangorn/alliance",13,13
+		!text "podziekowania dla:",13,13
+		!text "antaresa",13
+		!text "  za procke wypisywania znakow",13,13,0
+
+about2		!text "explorera",13
+		!text "  za wash'n'go - turboload'n'save",13,13
+		!text "mmsa",13
+		!text "  za 6502tass - crossassembler, bez",13
+		!text "  ktorego ten edytor by nie powstal",13,0
+
+bez	 !byte $fb,$ff,$f7,$f0,$f6,$f4
+	 !byte $f2,$f9,"3",$17,$01,"4"
+	 !byte $1a,$13,$05,$00,"5",$12
+	 !byte $04,"6",$03,$06,$14,$18
+	 !byte "7",$19,$07,"8",$02,$08
+	 !byte $15,$16,"9",$09,$0a,"0"
+	 !byte $0d,$0b,$0f,$0e,"+",$10
+	 !byte $0c,"-",".",":",$40,","
+	 !byte $1c,"*",";",$fd,$00,"="
+	 !byte $1e,"/","1",$1f,$00,"2"
+space	 !byte " ",$00,$11,$ee
+
+shift	 !byte $fc,$ed,$f8,$ef,$f5,$f3
+	 !byte $f1,$fa,"#","W","A","$"
+	 !byte "Z","S","E",$00,"%","R"
+	 !byte "D","&","C","F","T","X"
+	 !byte "'","Y","G","(","B","H"
+	 !byte "U","V",")","I","J",$00
+	 !byte "M","K","O","N",$ea,"P"
+	 !byte "L",$e9,">",$1b,$00,"<"
+	 !byte $97,$00,$1d,$fe,$00,$83
+	 !byte $89,"?","!",$95,$00,$22
+	 !byte " ",$00,"Q",$00
+
+ctrl	 !byte $00,$00,$00,$00,$00,$00
+	 !byte $00,$00,$91,$00,$ca,$92
+	 !byte $d2,$d0,$cc,$00,$87,$00
+	 !byte $e2,$8d,$cb,$df,$00,$d1
+	 !byte $8e,$00,$e0,$82,$00,$dd
+	 !byte $00,$00,$00,$00,$de,$00
+	 !byte $00,$00,$cf,$ce,$00,$00
+	 !byte $cd,$00,$00,$93,$00,$00
+	 !byte $85,$00,$94,$00,$00,$99
+	 !byte $8c,$00,$8f,$00,$00,$90
+	 !byte $00,$00,$00,$00
+
+comm	 !byte $da,$e6,$00,$e4,$e3,$e8
+	 !byte $e7,$00,$73,$dc,$c1,$74
+	 !byte $c9,$c6,$c3,$00,$75,$00
+	 !byte $e1,$76,$c2,$d7,$00,$c8
+	 !byte $77,$00,$00,$78,$d8,$00
+	 !byte $e5,$00,$8a,$00,$db,$8b
+	 !byte $00,$00,$c7,$c5,$ec,$00
+	 !byte $c4,$eb,$9e,$9b,$81,$9d
+	 !byte $84,$98,$9c,$d9,$00,$88
+	 !byte $9a,$86,$71,$96,$00,$72
+	 !byte $00,$00,$00,$00
+
+new	 !byte $fb,$ff,$f7,$f0,$f6,$f4
+	 !byte $f2,$f9,$00,$69,$64,$00
+	 !byte $66,$65,$6a,$00,$00,$6b
+	 !byte $8f,$00,$5c,$90,$62,$67
+	 !byte $00,$63,$91,$00,$5d,$92
+	 !byte $6c,$8b,$00,$6d,$6e,$00
+	 !byte $93,$6f,$5e,$94,$5b,$5f
+	 !byte $60,$5d,$00,$00,$61,$00
+	 !byte $8a,$5c,$00,$fd,$00,$00
+	 !byte $00,$00,$00,$00,$00,$00
+space2	 !byte " ",$00,$00,$ee
+
+ad40hiy
+		!for count, (yend-ystart) {
+		!byte >(((count+ystart)*40)+colormap)
+		}
+ad40loy
+		!for count, (yend-ystart) {
+		!byte <(((count+ystart)*40)+colormap)
+		}
